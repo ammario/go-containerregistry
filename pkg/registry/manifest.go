@@ -18,9 +18,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path"
 	"strings"
 	"sync"
 )
@@ -31,8 +34,10 @@ type manifest struct {
 }
 
 type manifests struct {
-	// maps repo -> manifest tag/digest -> manifest
-	manifests map[string]map[string]manifest
+	// manifests are structured as objects named "<repo>/<tag>" and "<repo>/<digest>"
+	// which contains a JSON-encoded manifest.
+	// An empty object simply named <repo> is created to indicate repo existence.
+	manifests objectStore
 	lock      sync.Mutex
 }
 
@@ -53,80 +58,105 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 	target := elem[len(elem)-1]
 	repo := strings.Join(elem[1:len(elem)-2], "/")
 
-	if req.Method == "GET" {
-		m.lock.Lock()
-		defer m.lock.Unlock()
-		c, ok := m.manifests[repo]
+	if req.Method == "GET" || req.Method == "HEAD" {
+		ok, err := objectExists(m.manifests, repo)
 		if !ok {
+			if err != nil {
+				return &regError{
+					Status:  http.StatusInternalServerError,
+					Code:    "MANIFEST_INVALID",
+					Message: err.Error(),
+				}
+			}
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "NAME_UNKNOWN",
 				Message: "Unknown name",
 			}
 		}
-		m, ok := c[target]
-		if !ok {
-			return &regError{
-				Status:  http.StatusNotFound,
-				Code:    "MANIFEST_UNKNOWN",
-				Message: "Unknown manifest",
-			}
-		}
-		rd := sha256.Sum256(m.blob)
-		d := "sha256:" + hex.EncodeToString(rd[:])
-		resp.Header().Set("Docker-Content-Digest", d)
-		resp.Header().Set("Content-Type", m.contentType)
-		resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
-		resp.WriteHeader(http.StatusOK)
-		io.Copy(resp, bytes.NewReader(m.blob))
-		return nil
-	}
 
-	if req.Method == "HEAD" {
-		m.lock.Lock()
-		defer m.lock.Unlock()
-		if _, ok := m.manifests[repo]; !ok {
-			return &regError{
-				Status:  http.StatusNotFound,
-				Code:    "NAME_UNKNOWN",
-				Message: "Unknown name",
-			}
-		}
-		m, ok := m.manifests[repo][target]
-		if !ok {
+		f, err := m.manifests.open(path.Join(repo, target), 0)
+		if err != nil {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "MANIFEST_UNKNOWN",
-				Message: "Unknown manifest",
+				Message: err.Error(),
 			}
 		}
+		defer f.Close()
+
+		var m manifest
+
+		err = json.NewDecoder(f).Decode(&m)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "ERROR",
+				Message: err.Error(),
+			}
+		}
+
 		rd := sha256.Sum256(m.blob)
 		d := "sha256:" + hex.EncodeToString(rd[:])
 		resp.Header().Set("Docker-Content-Digest", d)
 		resp.Header().Set("Content-Type", m.contentType)
 		resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
 		resp.WriteHeader(http.StatusOK)
+		if req.Method == "GET" {
+			_, _ = io.Copy(resp, bytes.NewReader(m.blob))
+		}
 		return nil
 	}
 
 	if req.Method == "PUT" {
-		m.lock.Lock()
-		defer m.lock.Unlock()
-		if _, ok := m.manifests[repo]; !ok {
-			m.manifests[repo] = map[string]manifest{}
+		// Create manifest existence indicator.
+		err := create(m.manifests, repo)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "ERROR",
+				Message: err.Error(),
+			}
 		}
 		b := &bytes.Buffer{}
-		io.Copy(b, req.Body)
+		_, _ = io.Copy(b, req.Body)
 		rd := sha256.Sum256(b.Bytes())
 		digest := "sha256:" + hex.EncodeToString(rd[:])
 		mf := manifest{
 			blob:        b.Bytes(),
 			contentType: req.Header.Get("Content-Type"),
 		}
-		// Allow future references by target (tag) and immutable digest.
+
 		// See https://docs.docker.com/engine/reference/commandline/pull/#pull-an-image-by-digest-immutable-identifier.
-		m.manifests[repo][target] = mf
-		m.manifests[repo][digest] = mf
+		targetFile, err := m.manifests.open(path.Join(repo, target), os.O_CREATE)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "ERROR",
+				Message: err.Error(),
+			}
+		}
+		defer targetFile.Close()
+
+		digestFile, err := m.manifests.open(path.Join(repo, digest), os.O_CREATE)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "ERROR",
+				Message: err.Error(),
+			}
+		}
+		defer digestFile.Close()
+
+		err = json.NewEncoder(io.MultiWriter(digestFile, targetFile)).Encode(mf)
+		if err != nil {
+			return &regError{
+				Status:  http.StatusInternalServerError,
+				Code:    "ERROR",
+				Message: err.Error(),
+			}
+		}
+
 		resp.Header().Set("Docker-Content-Digest", digest)
 		resp.WriteHeader(http.StatusCreated)
 		return nil

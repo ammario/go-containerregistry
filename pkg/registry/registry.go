@@ -71,7 +71,7 @@ func New() http.Handler {
 			uploads:  map[string][]byte{},
 		},
 		manifests: manifests{
-			manifests: map[string]map[string]manifest{},
+			manifests: newMemStore(),
 		},
 	}
 	return http.HandlerFunc(v.root)
